@@ -1,4 +1,5 @@
 import io
+import time
 from photon_packet_parser.message_type import MessageType
 from photon_packet_parser.command_type import CommandType
 from photon_packet_parser.segmented_package import SegmentedPackage
@@ -9,6 +10,8 @@ from photon_packet_parser.number_serializer import NumberSerializer
 
 COMMAND_HEADER_LENGTH = 12
 PHOTON_HEADER_LENGTH = 12
+_SEGMENT_TTL = 10.0
+
 
 class PhotonPacketParser:
     def __init__(self, on_event, on_request, on_response):
@@ -20,7 +23,7 @@ class PhotonPacketParser:
     def HandlePayload(self, payload):
         payload = io.BytesIO(payload)
 
-        if (payload.getbuffer().nbytes < PHOTON_HEADER_LENGTH):
+        if payload.getbuffer().nbytes < PHOTON_HEADER_LENGTH:
             return
 
         peerId = NumberSerializer.deserialize_short(payload)
@@ -31,23 +34,28 @@ class PhotonPacketParser:
         is_encrypted = flags == 1
         is_crc_enabled = flags == 0xCC
 
-        if (is_encrypted):
+        if is_encrypted:
             return
 
-        if (is_crc_enabled):
-            print("CRC is enabled")
-            offset = payload.tell()
-            payload.seek(0)
-            crc, _ = NumberSerializer.deserialize_int(payload)
-
-            payload.seek(offset)
-            payload = NumberSerializer.serialize(0, payload)
-
-            if (crc != CrcCalculator.calculate(payload, payload.getbuffer().nbytes)):
+        if is_crc_enabled:
+            crc = challenge
+            raw = bytearray(payload.getbuffer())
+            raw[8:12] = b'\x00\x00\x00\x00'
+            if crc != CrcCalculator.calculate(raw, len(raw)):
                 return
+
+        if self._pending_segments:
+            self._evict_stale_segments()
 
         for _ in range(command_count):
             self.HandleCommand(payload, command_count)
+
+    def _evict_stale_segments(self):
+        now = time.monotonic()
+        stale = [k for k, v in self._pending_segments.items()
+                 if now - v.created_at > _SEGMENT_TTL]
+        for k in stale:
+            del self._pending_segments[k]
 
     def HandleCommand(self, source: io.BytesIO, command_count: int):
         command_type = ByteReader.read_byte(source)
@@ -66,25 +74,35 @@ class PhotonPacketParser:
 
         command_length -= COMMAND_HEADER_LENGTH
 
+        if command_length < 0:
+            return
+
         if command_type == CommandType.Disconnect.value:
             return
         elif command_type == CommandType.SendUnreliable.value:
             source.read(4)
             command_length -= 4
-            self.HandleSendReliable(source, command_length)
+            if command_length >= 0:
+                self.HandleSendReliable(source, command_length)
         elif command_type == CommandType.SendReliable.value:
             self.HandleSendReliable(source, command_length)
         elif command_type == CommandType.SendFragment.value:
             self.HandleSendFragment(source, command_length)
         else:
-            source.read(command_length)            
+            source.read(command_length)
 
-    def HandleSendReliable(self,  source: io.BytesIO, command_length: int):
+    def HandleSendReliable(self, source: io.BytesIO, command_length: int):
         source.read(1)
         command_length -= 1
-        message_type = ByteReader.read_byte(source)[0]
+        message_type_data = ByteReader.read_byte(source)
+        if not message_type_data:
+            return
+        message_type = message_type_data[0]
         command_length -= 1
         operation_length = command_length
+
+        if operation_length < 0:
+            return
 
         payload = io.BytesIO(source.read(operation_length))
 
@@ -97,8 +115,6 @@ class PhotonPacketParser:
         elif message_type == MessageType.Event.value:
             event_data = Protocol16Deserializer.deserialize_event_data(payload)
             self.on_event(event_data)
-        # else:
-        #     print("Unknown message type: ", message_type)
 
     def HandleSendFragment(self, source: io.BytesIO, command_length: int):
         sequence_number = NumberSerializer.deserialize_int(source)
@@ -114,6 +130,9 @@ class PhotonPacketParser:
 
         fragment_length = command_length
 
+        if fragment_length < 0 or total_length == 0:
+            return
+
         self.HandleSegmentedPayload(sequence_number, total_length, fragment_length, fragment_offset, source)
 
     def GetSegmentedPackage(self, start_sequence_number, total_length):
@@ -125,7 +144,7 @@ class PhotonPacketParser:
         self._pending_segments[start_sequence_number] = segmented_package
 
         return segmented_package
- 
+
     def HandleSegmentedPayload(self, start_sequence_number, total_length, fragment_length, fragment_offset, source):
         segmented_package = self.GetSegmentedPackage(start_sequence_number, total_length)
 
