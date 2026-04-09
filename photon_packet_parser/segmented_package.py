@@ -3,3 +3,4 @@ class SegmentedPackage:
         self.total_length = total_length
         self.bytes_written = bytes_written
         self.total_payload = total_payload
+        self.received_offsets: set = set()

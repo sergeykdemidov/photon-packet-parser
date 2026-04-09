@@ -93,7 +93,7 @@ class PhotonPacketParser:
             self.on_request(request_data)
         elif message_type == MessageType.OperationResponse.value:
             response_data = Protocol16Deserializer.deserialize_operation_response(payload)
-            self.on_request(response_data)
+            self.on_response(response_data)
         elif message_type == MessageType.Event.value:
             event_data = Protocol16Deserializer.deserialize_event_data(payload)
             self.on_event(event_data)
@@ -129,10 +129,11 @@ class PhotonPacketParser:
     def HandleSegmentedPayload(self, start_sequence_number, total_length, fragment_length, fragment_offset, source):
         segmented_package = self.GetSegmentedPackage(start_sequence_number, total_length)
 
-        for i in range(fragment_length):
-            segmented_package.total_payload[fragment_offset + i] = source.read(1)[0]
-
-        segmented_package.bytes_written += fragment_length
+        data = source.read(fragment_length)
+        if fragment_offset not in segmented_package.received_offsets:
+            segmented_package.received_offsets.add(fragment_offset)
+            segmented_package.total_payload[fragment_offset:fragment_offset + fragment_length] = data
+            segmented_package.bytes_written += fragment_length
 
         if segmented_package.bytes_written >= segmented_package.total_length:
             self._pending_segments.pop(start_sequence_number)
